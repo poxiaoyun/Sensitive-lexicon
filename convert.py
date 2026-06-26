@@ -5,9 +5,91 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import List, Dict
+
+
+# === 评分逻辑：1-10 分制 ===
+# 类别基线分（按法律/平台风险等级，1=低风险，10=极高风险）
+CATEGORY_BASELINE: Dict[str, int] = {
+    "暴恐词库": 9,
+    "涉枪涉爆": 10,
+    "反动词库": 9,
+    "政治类型": 9,
+    "色情词库": 7,
+    "色情类型": 7,
+    "贪腐词库": 8,
+    "GFW补充词库": 8,
+    "网易前端过滤敏感词库": 7,
+    "零时-Tencent": 7,
+    "新思想启蒙": 6,
+    "民生词库": 5,
+    "COVID-19词库": 5,
+    "补充词库": 6,
+    "广告类型": 3,
+    "其他词库": 4,
+    "非法网址": 5,
+}
+DEFAULT_BASELINE = 5
+
+# 各类别高危关键词（命中 +2，cap 10）
+CATEGORY_BOOST_WORDS: Dict[str, List[str]] = {
+    "色情词库": ["操", "逼", "奸", "肏", "做爱", "性交", "群交", "轮奸", "强奸", "嫖", "鸡奸"],
+    "色情类型": ["操", "逼", "奸", "肏", "做爱", "性交", "群交", "轮奸", "强奸", "嫖", "鸡奸"],
+    "涉枪涉爆": ["炸弹", "炸药", "火药", "雷管", "燃烧弹", "手榴弹", "弹药", "起爆", "硝酸甘油", "TNT"],
+    "暴恐词库": ["法轮", "法轮功", "flg", "falungong", "恐怖", "极端", "圣战", "暴恐"],
+    "反动词库": ["打倒", "推翻", "颠覆", "灭亡", "亡党", "分裂", "独立", "解放"],
+    "政治类型": ["打倒", "推翻", "下台", "灭共", "亡党", "暗杀", "刺杀", "政变"],
+    "贪腐词库": ["贪腐", "腐败", "贪官", "受贿", "洗钱", "权钱交易", "巨腐"],
+    "广告类型": ["代购", "刷单", "兼职", "色情", "招嫖", "包夜", "全套"],
+}
+
+URL_PATTERN = re.compile(r"^(?:https?://)?[\w-]+(?:\.[\w-]+)+(?:[/:#?].*)?$")
+ASCII_ONLY_PATTERN = re.compile(r"^[A-Za-z0-9._\-+:/?]+$")
+CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+DIGIT_OR_SYMBOL_VARIANT_PATTERN = re.compile(r"[0-9@#$%^&*_~`]")
+
+
+def score_term(term: str, category: str) -> int:
+    """对单条词条打 1-10 分。"""
+    baseline = CATEGORY_BASELINE.get(category, DEFAULT_BASELINE)
+
+    # URL/域名：分数固定为 5（无语义严重度，按风险中等处理）
+    if URL_PATTERN.match(term.strip()):
+        return 5
+
+    score = baseline
+
+    # 修正 1：纯 ASCII 短代号、长度 ≤ 3，误判风险高 → -2
+    if ASCII_ONLY_PATTERN.match(term) and len(term) <= 3:
+        score -= 2
+
+    # 修正 2：长度 ≥ 6 的中文短语，更具体、置信度更高 → +1
+    cjk_count = len(CJK_PATTERN.findall(term))
+    if cjk_count >= 6:
+        score += 1
+
+    # 修正 3：含数字/符号谐音变体（如 9风、fl功、十7大）→ +1（规避变体，故意为之）
+    if DIGIT_OR_SYMBOL_VARIANT_PATTERN.search(term) and CJK_PATTERN.search(term):
+        score += 1
+
+    # 修正 4：长度 ≥ 8 的长短语（多见于具体描述、教唆）→ +1
+    if len(term) >= 8:
+        score += 1
+
+    # 加权：高危关键词命中 → +2
+    boost_words = CATEGORY_BOOST_WORDS.get(category, [])
+    if boost_words:
+        term_lower = term.lower()
+        for kw in boost_words:
+            if kw.lower() in term_lower:
+                score += 2
+                break  # 命中一次即可
+
+    # clamp 到 [1, 10]
+    return max(1, min(10, score))
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,8 +121,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--score",
         type=int,
-        default=1,
-        help="默认 score，默认：1",
+        default=None,
+        help="固定分数（1-10）；不指定时按类别+规则自动评分。",
+    )
+    parser.add_argument(
+        "--score-mode",
+        choices=["auto", "fixed"],
+        default="auto",
+        help="评分模式：auto=自动（默认），fixed=使用 --score 指定的固定分数。",
     )
     parser.add_argument(
         "--keep-duplicates",
@@ -107,11 +195,18 @@ def build_record(term: str, category: str, score: int) -> Dict:
     }
 
 
-def convert_file(file_path: Path, score: int, keep_duplicates: bool) -> List[Dict]:
+def convert_file(file_path: Path, score_mode: str, fixed_score, keep_duplicates: bool) -> List[Dict]:
     category = file_path.stem
     text = read_text_with_fallback(file_path)
     terms = clean_terms(text, keep_duplicates=keep_duplicates)
-    return [build_record(term, category, score) for term in terms]
+    records = []
+    for term in terms:
+        if score_mode == "fixed" and fixed_score is not None:
+            s = fixed_score
+        else:
+            s = score_term(term, category)
+        records.append(build_record(term, category, s))
+    return records
 
 
 def write_json(file_path: Path, data: List[Dict]) -> None:
@@ -158,7 +253,8 @@ def main() -> int:
             try:
                 records = convert_file(
                     file_path=file_path,
-                    score=args.score,
+                    score_mode=args.score_mode,
+                    fixed_score=args.score,
                     keep_duplicates=args.keep_duplicates,
                 )
                 merged_data.extend(records)
@@ -175,7 +271,8 @@ def main() -> int:
             try:
                 records = convert_file(
                     file_path=file_path,
-                    score=args.score,
+                    score_mode=args.score_mode,
+                    fixed_score=args.score,
                     keep_duplicates=args.keep_duplicates,
                 )
                 output_file = output_dir / f"{file_path.stem}.json"
